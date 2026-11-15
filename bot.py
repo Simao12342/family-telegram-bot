@@ -333,7 +333,7 @@ async def play_game(callback: types.CallbackQuery):
         "joke": "Розкажи один добрий, веселий сімейний жарт українською мовою."
     }
     await callback.answer("Думаю... 🎲")
-    response = ai_client.models.generate_content(model="gemini-2.5-flash", contents=prompts[action])
+    response = ai_client.models.generate_content(model="gemini-1.5-flash", contents=prompts[action])
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Ще варіант", callback_data=f"game_{action}"),
                                                  InlineKeyboardButton(text="« Назад", callback_data="menu_games")]])
     await callback.message.edit_text(response.text, reply_markup=kb)
@@ -362,7 +362,7 @@ async def answer_ai(message: types.Message, state: FSMContext):
         f"Запит користувача: {message.text}"
     )
     try:
-        response = ai_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        response = ai_client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]])
         await wait_msg.edit_text(response.text, reply_markup=kb)
     except Exception as e:
