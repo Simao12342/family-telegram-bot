@@ -31,6 +31,9 @@ class ShoppingStates(StatesGroup):
 class BudgetStates(StatesGroup):
     waiting_for_amount = State()
 
+class TaskStates(StatesGroup):
+    waiting_for_task = State()
+
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Список покупок", callback_data="menu_shopping"),
@@ -113,7 +116,6 @@ async def process_new_budget(message: types.Message, state: FSMContext):
         date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
         user_name = message.from_user.first_name
 
-        # Записуємо в аркуш «Бюджет»: Дата, Категорія, Сума, Хто витратив, Коментар
         sheet_budget.append_row([date_str, category, amount, user_name, comment])
         await state.clear()
 
@@ -124,6 +126,52 @@ async def process_new_budget(message: types.Message, state: FSMContext):
         await message.answer(f"✅ Витрату на суму **{amount} грн** ({category}) успішно збережено!", reply_markup=keyboard, parse_mode="Markdown")
     except Exception as e:
         await message.answer("⚠️ Невірний формат. Будь ласка, введи спочатку суму числом, наприклад: `350 Продукти`")
+
+# --- БЛОК ЗАВДАНЬ ---
+@dp.callback_query(F.data == "menu_tasks")
+async def show_tasks(callback: types.CallbackQuery):
+    try:
+        records = sheet_tasks.get_all_records()
+        text = "📋 **Сімейні завдання:**\n\n"
+        if not records:
+            text += "Поки що немає завдань."
+        else:
+            for row in records:
+                status = "✅" if str(row.get("Статус")).lower() == "виконано" else "⏳"
+                text += f"{status} {row.get('Завдання')} — *{row.get('Виконавець')}*\n"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Додати завдання", callback_data="add_task")],
+            [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
+        ])
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    except Exception as e:
+        await callback.message.answer(f"Помилка читання таблиці: {e}")
+
+@dp.callback_query(F.data == "add_task")
+async def start_add_task(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи завдання та виконавця у форматі: `Суть завдання | Хто робить`\nНаприклад: `Винести сміття | Сергій` або `Полити квіти | Оля`")
+    await state.set_state(TaskStates.waiting_for_task)
+    await callback.answer()
+
+@dp.message(TaskStates.waiting_for_task)
+async def process_new_task(message: types.Message, state: FSMContext):
+    parts = message.text.split("|")
+    try:
+        task_text = parts[0].strip()
+        assignee = parts[1].strip() if len(parts) > 1 else "Всі"
+        
+        # Записуємо в аркуш «Завдання»: Завдання, Виконавець, Статус
+        sheet_tasks.append_row([task_text, assignee, "В процесі"])
+        await state.clear()
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 До завдань", callback_data="menu_tasks")],
+            [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
+        ])
+        await message.answer(f"✅ Завдання **«{task_text}»** призначено для **{assignee}**!", reply_markup=keyboard, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer("⚠️ Невірний формат. Використовуй розмежувач `|`, наприклад: `Винести сміття | Сергій`")
 
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery):
