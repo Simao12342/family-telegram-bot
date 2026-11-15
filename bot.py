@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import gspread
+from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
@@ -24,9 +25,11 @@ sheet_tasks = sh.worksheet("Завдання")
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Стани для FSM (очікування введення назви товару)
 class ShoppingStates(StatesGroup):
     waiting_for_item = State()
+
+class BudgetStates(StatesGroup):
+    waiting_for_amount = State()
 
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -42,6 +45,7 @@ async def cmd_start(message: types.Message):
         reply_markup=main_menu()
     )
 
+# --- БЛОК ПОКУПОК ---
 @dp.callback_query(F.data == "menu_shopping")
 async def show_shopping(callback: types.CallbackQuery):
     try:
@@ -50,7 +54,7 @@ async def show_shopping(callback: types.CallbackQuery):
         if not records:
             text += "Список поки порожній."
         else:
-            for idx, row in enumerate(records, start=2):
+            for row in records:
                 status = "✅" if str(row.get("Куплено")).lower() == "так" else "❌"
                 text += f"{status} {row.get('Товар')} — *{row.get('Категорія')}*\n"
         
@@ -71,7 +75,6 @@ async def start_add_shopping(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(ShoppingStates.waiting_for_item)
 async def process_new_item(message: types.Message, state: FSMContext):
     item_name = message.text
-    # Додаємо в таблицю: Товар, Категорія (за замовчуванням Продукти), Куплено (Ні)
     sheet_shopping.append_row([item_name, "Продукти", "Ні"])
     await state.clear()
     
@@ -80,6 +83,47 @@ async def process_new_item(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
     ])
     await message.answer(f"✅ Товар **«{item_name}»** успішно додано до таблиці!", reply_markup=keyboard, parse_mode="Markdown")
+
+# --- БЛОК БЮДЖЕТУ ---
+@dp.callback_query(F.data == "menu_budget")
+async def show_budget(callback: types.CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Додати витрату", callback_data="add_budget")],
+        [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
+    ])
+    await callback.message.edit_text(
+        "💰 **Сімейний бюджет**\n\nТут ти можеш вести облік спільних витрат. Обери дію нижче:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "add_budget")
+async def start_add_budget(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи витрату у форматі: `Сума Категорія Коментар`\nНаприклад: `350 Продукти Супермаркет` або просто `150 Кав'ярня`")
+    await state.set_state(BudgetStates.waiting_for_amount)
+    await callback.answer()
+
+@dp.message(BudgetStates.waiting_for_amount)
+async def process_new_budget(message: types.Message, state: FSMContext):
+    parts = message.text.split(maxsplit=2)
+    try:
+        amount = parts[0]
+        category = parts[1] if len(parts) > 1 else "Інше"
+        comment = parts[2] if len(parts) > 2 else ""
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        user_name = message.from_user.first_name
+
+        # Записуємо в аркуш «Бюджет»: Дата, Категорія, Сума, Хто витратив, Коментар
+        sheet_budget.append_row([date_str, category, amount, user_name, comment])
+        await state.clear()
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 До бюджету", callback_data="menu_budget")],
+            [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
+        ])
+        await message.answer(f"✅ Витрату на суму **{amount} грн** ({category}) успішно збережено!", reply_markup=keyboard, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer("⚠️ Невірний формат. Будь ласка, введи спочатку суму числом, наприклад: `350 Продукти`")
 
 @dp.callback_query(F.data == "back_home")
 async def back_home(callback: types.CallbackQuery):
