@@ -12,8 +12,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 logging.basicConfig(level=logging.INFO)
 
 # Токен твого бота (краще пізніше винести в змінні середовища GitHub/Render, але для старти можна прописати тут)
-TOKEN = "ТВІЙ_ТОКЕН_БОТА_ВІД_BOTFATHER"
-SPREADSHEET_ID = "ID_ТВОЄЇ_ГУГЛ_ТАБЛИЦІ"
+TOKEN = "9068759664:AAETWWERqdgOxLGq1h4DFj3H_3gDa90JU8s"
+SPREADSHEET_ID = "1PFK_1jeFHyK5AxBxjoqMGdJieMCtQe7XksBWY1hnmsU"
 
 # Авторизація в Google Таблицях через JSON файл (файл назвемо credentials.json)
 gc = gspread.service_account(filename="credentials.json")
