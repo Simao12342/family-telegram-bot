@@ -15,7 +15,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 logging.basicConfig(level=logging.INFO)
 
 # --- НАЛАШТУВАННЯ ---
-TOKEN = "9068759664:AAETWWERqdgOxLGq1h4DFj3H_3gDa90JU8s"
+TOKEN = "9068759664:AAGz8Fj_h1ymt2uylPnK786p4TDWMw_z7gQ"
 SPREADSHEET_ID = "1PFK_1jeFHyK5AxBxjoqMGdJieMCtQe7XksBWY1hnmsU"
 GEMINI_API_KEY = "AQ.Ab8RN6JRgTBlbdv3CBB9CDi4QCH-lDsEB2Tb8Igbye8NWRYhIA"
 
