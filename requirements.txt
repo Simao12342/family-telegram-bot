@@ -1,5 +1,4 @@
-aiogram==3.4.1
-gspread==6.1.2
-google-auth==2.35.0
-aiohttp==3.10.5
-pydantic==2.6.4
+aiogram>=3.4.0
+gspread>=6.0.0
+google-auth>=2.0.0
+aiohttp>=3.9.0
