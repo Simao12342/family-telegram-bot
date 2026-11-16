@@ -1,390 +1,381 @@
 import asyncio
+import json
 import logging
 import os
-import random
-from datetime import datetime
+import re
+import threading
+import uuid
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
+
 import gspread
-from aiohttp import web
 from google import genai
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from google.genai import types
+from telegram import InlineKeyboardButton as B
+from telegram import InlineKeyboardMarkup as M
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("family-bot")
 
-# --- НАЛАШТУВАННЯ ---
-TOKEN = ""
-SPREADSHEET_ID = ""
-GEMINI_API_KEY = ""
+# ---------- Налаштування (усе беремо зі змінних середовища Render) ----------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+ALLOWED = {int(x) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()}
+TZ = ZoneInfo("Europe/Kyiv")
 
-# Ініціалізація ШІ
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Ініціалізація Google Таблиць
-gc = gspread.service_account(filename="credentials.json")
-sh = gc.open_by_key(SPREADSHEET_ID)
+def now():
+    return datetime.now(TZ)
 
-sheet_shopping = sh.worksheet("Покупки")
-sheet_budget = sh.worksheet("Бюджет")
-sheet_tasks = sh.worksheet("Завдання")
-sheet_calendar = sh.worksheet("Календар")
-sheet_album = sh.worksheet("Альбом")
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+def allowed(update: Update) -> bool:
+    return not ALLOWED or update.effective_user.id in ALLOWED
 
-# --- СТАНИ FSM ---
-class BotStates(StatesGroup):
-    add_shopping = State()
-    add_budget = State()
-    add_task = State()
-    add_event = State()
-    add_photo = State()
-    ask_ai = State()
 
-# --- ГОЛОВНЕ МЕНЮ ---
-def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Календар подій", callback_data="menu_calendar"),
-         InlineKeyboardButton(text="🛒 Список покупок", callback_data="menu_shopping")],
-        [InlineKeyboardButton(text="💰 Сімейний бюджет", callback_data="menu_budget"),
-         InlineKeyboardButton(text="📋 Сімейні завдання", callback_data="menu_tasks")],
-        [InlineKeyboardButton(text="📸 Фотоальбом", callback_data="menu_album"),
-         InlineKeyboardButton(text="🎲 Розваги та ігри", callback_data="menu_games")],
-        [InlineKeyboardButton(text="🧠 Розумний ШІ-помічник", callback_data="menu_ai")]
-    ])
+# ---------- Google Sheets ----------
+def _creds():
+    raw = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"].strip()
+    if raw.startswith("{"):
+        return json.loads(raw)
+    with open(raw, encoding="utf-8") as f:  # якщо це шлях до Secret File
+        return json.load(f)
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "🏡 **Family Bot — ваш сімейний помічник!**\n\n"
-        "Оберіть потрібний розділ у меню нижче або просто напишіть мені запитання:",
-        reply_markup=main_menu(),
-        parse_mode="Markdown"
-    )
 
-@dp.callback_query(F.data == "back_home")
-async def back_home(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("🏡 **Головне меню Family Bot:**", reply_markup=main_menu(), parse_mode="Markdown")
+book = gspread.service_account_from_dict(_creds()).open_by_key(SPREADSHEET_ID)
+HEAD = ["id", "дата", "автор", "текст", "сума"]
 
-# ==========================================
-# 1. КАЛЕНДАР ПОДІЙ
-# ==========================================
-@dp.callback_query(F.data == "menu_calendar")
-async def show_calendar(callback: types.CallbackQuery):
-    records = sheet_calendar.get_all_records()
-    text = "📅 **Сімейний календар подій:**\n\n"
-    if not records:
-        text += "Запланованих подій поки немає."
-    else:
-        for row in records:
-            text += f"📌 **{row.get('Дата')}** — {row.get('Подія')} *(додав: {row.get('Хто додав')})*\n"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Додати подію / ДН", callback_data="add_event")],
-        [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
 
-@dp.callback_query(F.data == "add_event")
-async def start_add_event(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введіть дату та назву події через тире.\nНаприклад: `23.11.2026 - День народження тата`")
-    await state.set_state(BotStates.add_event)
-    await callback.answer()
-
-@dp.message(BotStates.add_event)
-async def save_event(message: types.Message, state: FSMContext):
-    parts = message.text.split("-", maxsplit=1)
-    date_str = parts[0].strip()
-    event_name = parts[1].strip() if len(parts) > 1 else message.text
-    sheet_calendar.append_row([date_str, event_name, message.from_user.first_name])
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📅 До календаря", callback_data="menu_calendar")]])
-    await message.answer(f"✅ Подію **{event_name}** ({date_str}) збережено!", reply_markup=kb, parse_mode="Markdown")
-
-# ==========================================
-# 2. СПИСОК ПОКУПОК (З ІНТЕРАКТИВНИМ ЗАКРИТТЯМ)
-# ==========================================
-@dp.callback_query(F.data == "menu_shopping")
-async def show_shopping(callback: types.CallbackQuery):
-    records = sheet_shopping.get_all_records()
-    text = "🛒 **Сімейний список покупок:**\n*(Натисніть на товар знизу, щоб відмітити «Куплено»)*\n\n"
-    buttons = []
-    
-    active_count = 0
-    for idx, row in enumerate(records, start=2):
-        is_bought = str(row.get("Куплено")).lower() == "так"
-        if not is_bought:
-            active_count += 1
-            item = row.get("Товар")
-            cat = row.get("Категорія")
-            text += f"▫️ {item} *({cat})*\n"
-            buttons.append([InlineKeyboardButton(text=f"✅ Куплено: {item}", callback_data=f"buy_{idx}")])
-            
-    if active_count == 0:
-        text += "🎉 Усе куплено! Список порожній."
-
-    buttons.append([InlineKeyboardButton(text="➕ Додати товар", callback_data="add_shopping")])
-    buttons.append([InlineKeyboardButton(text="« Головне меню", callback_data="back_home")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def mark_bought(callback: types.CallbackQuery):
-    row_idx = int(callback.data.split("_")[1])
-    sheet_shopping.update_cell(row_idx, 3, "Так")
-    await callback.answer("Відмічено як куплено! ✅")
-    await show_shopping(callback)
-
-@dp.callback_query(F.data == "add_shopping")
-async def start_add_shopping(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Напишіть товар (можна з категорією в дужках).\nНаприклад: `Молоко` або `Порошок (Побутова хімія)`")
-    await state.set_state(BotStates.add_shopping)
-    await callback.answer()
-
-@dp.message(BotStates.add_shopping)
-async def save_shopping(message: types.Message, state: FSMContext):
-    text = message.text
-    if "(" in text and ")" in text:
-        item = text.split("(")[0].strip()
-        cat = text.split("(")[1].replace(")", "").strip()
-    else:
-        item = text.strip()
-        cat = "Продукти"
-    sheet_shopping.append_row([item, cat, "Ні"])
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 До списку покупок", callback_data="menu_shopping")]])
-    await message.answer(f"✅ Додано: **{item}** ({cat})", reply_markup=kb, parse_mode="Markdown")
-
-# ==========================================
-# 3. СІМЕЙНИЙ БЮДЖЕТ (ЗІ СТАТИСТИКОЮ)
-# ==========================================
-@dp.callback_query(F.data == "menu_budget")
-async def show_budget(callback: types.CallbackQuery):
-    records = sheet_budget.get_all_records()
-    total = 0
-    by_category = {}
-    by_person = {}
-    
-    for row in records:
-        try:
-            amount = float(str(row.get("Сума", 0)).replace(",", "."))
-            cat = row.get("Категорія", "Інше")
-            person = row.get("Хто витратив", "Невідомо")
-            total += amount
-            by_category[cat] = by_category.get(cat, 0) + amount
-            by_person[person] = by_person.get(person, 0) + amount
-        except ValueError:
-            continue
-
-    text = f"💰 **Сімейний бюджет**\n\n📊 **Загальні витрати:** `{total:.0f} грн`\n\n**По категоріях:**\n"
-    for cat, s in by_category.items():
-        text += f"• {cat}: {s:.0f} грн\n"
-    
-    text += "\n**Хто скільки витратив:**\n"
-    for p, s in by_person.items():
-        text += f"👤 {p}: {s:.0f} грн\n"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Записати витрату", callback_data="add_budget")],
-        [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
-
-@dp.callback_query(F.data == "add_budget")
-async def start_add_budget(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введіть витрату: `Сума Категорія Коментар`\nНаприклад: `450 Автомобіль Пальне` або `220 Продукти`")
-    await state.set_state(BotStates.add_budget)
-    await callback.answer()
-
-@dp.message(BotStates.add_budget)
-async def save_budget(message: types.Message, state: FSMContext):
-    parts = message.text.split(maxsplit=2)
+def _sheet(name):
     try:
-        amount = float(parts[0].replace(",", "."))
-        cat = parts[1] if len(parts) > 1 else "Інше"
-        comment = parts[2] if len(parts) > 2 else ""
-        date_str = datetime.now().strftime("%d.%m.%Y")
-        sheet_budget.append_row([date_str, cat, amount, message.from_user.first_name, comment])
-        await state.clear()
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 До бюджету", callback_data="menu_budget")]])
-        await message.answer(f"✅ Витрату **{amount:.0f} грн** ({cat}) записано!", reply_markup=kb, parse_mode="Markdown")
-    except ValueError:
-        await message.answer("⚠️ Почніть повідомлення з суми числом, наприклад: `350 Продукти`")
+        return book.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = book.add_worksheet(name, 1000, len(HEAD))
+        ws.append_row(HEAD)
+        return ws
 
-# ==========================================
-# 4. СІМЕЙНІ ЗАВДАННЯ (З ЗАКРИТТЯМ)
-# ==========================================
-@dp.callback_query(F.data == "menu_tasks")
-async def show_tasks(callback: types.CallbackQuery):
-    records = sheet_tasks.get_all_records()
-    text = "📋 **Активні сімейні завдання:**\n\n"
-    buttons = []
-    active = 0
-    for idx, row in enumerate(records, start=2):
-        if str(row.get("Статус")).lower() != "виконано":
-            active += 1
-            task = row.get("Завдання")
-            person = row.get("Виконавець")
-            text += f"⏳ **{task}** — *{person}*\n"
-            buttons.append([InlineKeyboardButton(text=f"✔️ Виконано: {task}", callback_data=f"done_{idx}")])
-            
-    if active == 0:
-        text += "✨ Всі домашні завдання виконані!"
 
-    buttons.append([InlineKeyboardButton(text="➕ Призначити завдання", callback_data="add_task")])
-    buttons.append([InlineKeyboardButton(text="« Головне меню", callback_data="back_home")])
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+def _add(sec, author, text, extra=""):
+    rid = "i" + uuid.uuid4().hex[:6]
+    _sheet(sec).append_row(
+        [rid, now().strftime("%d.%m.%Y %H:%M"), author, text, extra],
+        value_input_option="RAW",
+    )
+    return rid
 
-@dp.callback_query(F.data.startswith("done_"))
-async def mark_task_done(callback: types.CallbackQuery):
-    row_idx = int(callback.data.split("_")[1])
-    sheet_tasks.update_cell(row_idx, 3, "Виконано")
-    await callback.answer("Завдання закрито! 🎉")
-    await show_tasks(callback)
 
-@dp.callback_query(F.data == "add_task")
-async def start_add_task(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Формат: `Завдання | Виконавець`\nНаприклад: `Помити автомобіль | Сергій`")
-    await state.set_state(BotStates.add_task)
-    await callback.answer()
+def _rows(sec):
+    return _sheet(sec).get_all_records()
 
-@dp.message(BotStates.add_task)
-async def save_task(message: types.Message, state: FSMContext):
-    parts = message.text.split("|")
-    task = parts[0].strip()
-    person = parts[1].strip() if len(parts) > 1 else "Сім'я"
-    sheet_tasks.append_row([task, person, "В процесі"])
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 До завдань", callback_data="menu_tasks")]])
-    await message.answer(f"✅ Завдання **«{task}»** призначено для **{person}**!", reply_markup=kb, parse_mode="Markdown")
 
-# ==========================================
-# 5. СІМЕЙНИЙ ФОТОАЛЬБОМ
-# ==========================================
-@dp.callback_query(F.data == "menu_album")
-async def show_album(callback: types.CallbackQuery):
-    records = sheet_album.get_all_records()
-    text = f"📸 **Сімейний фотоальбом**\nЗбережено спогадів: **{len(records)}**\n\n"
-    if records:
-        last = records[-1]
-        text += f"Останнє фото: *{last.get('Опис')}* ({last.get('Дата')})"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Зберегти фото в альбом", callback_data="add_photo")],
-        [InlineKeyboardButton(text="🖼 Показати випадкове фото", callback_data="random_photo")],
-        [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+def _del(sec, rid):
+    ws = _sheet(sec)
+    cell = ws.find(rid, in_column=1)
+    if cell:
+        ws.delete_rows(cell.row)
 
-@dp.callback_query(F.data == "add_photo")
-async def start_add_photo(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Надішліть фотографію та додайте підпис до неї (наприклад: *Прогулянка в парку*):")
-    await state.set_state(BotStates.add_photo)
-    await callback.answer()
 
-@dp.message(BotStates.add_photo, F.photo)
-async def save_photo(message: types.Message, state: FSMContext):
-    file_id = message.photo[-1].file_id
-    caption = message.caption if message.caption else "Сімейне фото"
-    date_str = datetime.now().strftime("%d.%m.%Y")
-    sheet_album.append_row([date_str, "Сім'я", caption, file_id])
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📸 До альбому", callback_data="menu_album")]])
-    await message.answer("✅ Фото збережено у сімейний архів!", reply_markup=kb)
+# ---------- Розділи ----------
+SECTIONS = {
+    "events": ("📅 Календар подій", "Напишіть подію, напр.: 17.07 18:00 День народження тата"),
+    "shifts": ("🕒 Графік змін", "Напишіть зміну, напр.: 20.11 Сергій день"),
+    "shop": ("🛒 Покупки", "Напишіть, що купити (можна кілька рядків)."),
+    "budget": ("💰 Сімейний бюджет", "Витрата: «хліб 45». Дохід із плюсом: «+ зарплата 20000»."),
+    "tasks": ("📋 Завдання", "Напишіть нове завдання."),
+}
+CHECK = {"shop", "tasks"}  # списки з кнопкою ✅
+TITLES = {
+    **{k: v[0] for k, v in SECTIONS.items()},
+    "photos": "📸 Фотоальбом",
+    "remind": "🔔 Нагадування",
+    "ai": "🤖 AI-помічник",
+}
+ORDER = ["events", "shifts", "shop", "budget", "photos", "tasks", "remind", "ai"]
+MENU_TEXT = "🏡 FAMILY BOT\nВітаю у сімейному помічнику! Оберіть розділ:"
 
-@dp.callback_query(F.data == "random_photo")
-async def send_random_photo(callback: types.CallbackQuery):
-    records = sheet_album.get_all_records()
-    if not records:
-        await callback.answer("Альбом поки порожній!", show_alert=True)
+
+def menu_kb():
+    btns = [B(TITLES[k], callback_data=f"m:{k}") for k in ORDER]
+    return M([btns[i : i + 2] for i in range(0, len(btns), 2)])
+
+
+BACK = [B("⬅️ Меню", callback_data="menu")]
+
+
+def build_view(key):
+    """Текст і кнопки розділу (синхронно, викликати через to_thread)."""
+    title = TITLES[key]
+    rows = _rows(key)
+    kb = []
+    if key in CHECK:
+        head = f"Відкритих: {len(rows)}. Натисніть, щоб відмітити виконаним." if rows else "Поки порожньо."
+        text = f"{title}\n\n{head}\n\n{SECTIONS[key][1]}"
+        kb = [[B("✅ " + str(r["текст"])[:40], callback_data=f"d:{key}:{r['id']}")] for r in rows[:30]]
+    elif key == "remind":
+        text = f"{title}\n\n" + ("Заплановано:" if rows else "Немає активних нагадувань.")
+        text += (
+            "\n\nНапишіть, коли нагадати:\n"
+            "• 30 хв винести сміття\n• 18:30 забрати дітей\n• 20.11 09:00 лікар"
+        )
+        for r in rows[:30]:
+            due = str(r["сума"]).split("|")[0]
+            try:
+                due = datetime.fromisoformat(due).strftime("%d.%m %H:%M")
+            except ValueError:
+                pass
+            kb.append([B(f"🗑 {due} {str(r['текст'])[:30]}", callback_data=f"d:{key}:{r['id']}")])
+    elif key == "budget":
+        month = now().strftime("%m.%Y")
+        inc = exp = 0.0
+        for r in rows:
+            if str(r["дата"])[3:10] == month:
+                s = float(r["сума"] or 0)
+                inc += max(s, 0)
+                exp += min(s, 0)
+        last = "\n".join(
+            f"{str(r['дата'])[:5]} {r['автор']}: {float(r['сума'] or 0):+.0f} {r['текст']}"
+            for r in rows[-12:]
+        )
+        text = (
+            f"{title}\n\nЦей місяць: доходи +{inc:.0f}, витрати {exp:.0f}, баланс {inc + exp:+.0f}\n\n"
+            f"{last or 'Записів ще немає.'}\n\n{SECTIONS[key][1]}"
+        )
+    else:
+        last = "\n".join(f"• {r['текст']}  ({r['автор']})" for r in rows[-15:])
+        text = f"{title}\n\n{last or 'Записів ще немає.'}\n\n{SECTIONS[key][1]}"
+    kb.append(BACK)
+    return text, M(kb)
+
+
+# ---------- Нагадування ----------
+def parse_when(t):
+    n = now()
+    m = re.match(r"^(\d+)\s*(хв|год)\w*\s+(.+)$", t, re.I | re.S)
+    if m:
+        mins = int(m[1]) * (1 if m[2].lower() == "хв" else 60)
+        return n + timedelta(minutes=mins), m[3]
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})\s+(.+)$", t, re.S)
+    if m:
+        due = n.replace(month=int(m[2]), day=int(m[1]), hour=int(m[3]), minute=int(m[4]), second=0, microsecond=0)
+        if due < n:
+            due = due.replace(year=n.year + 1)
+        return due, m[5]
+    m = re.match(r"^(\d{1,2}):(\d{2})\s+(.+)$", t, re.S)
+    if m:
+        due = n.replace(hour=int(m[1]), minute=int(m[2]), second=0, microsecond=0)
+        if due <= n:
+            due += timedelta(days=1)
+        return due, m[3]
+    return None
+
+
+async def fire(ctx: ContextTypes.DEFAULT_TYPE):
+    d = ctx.job.data
+    await ctx.bot.send_message(d["chat"], f"🔔 Нагадування: {d['text']}")
+    await asyncio.to_thread(_del, "remind", d["rid"])
+
+
+def schedule(jq, rid, chat_id, due, text):
+    delay = max((due - now()).total_seconds(), 3)
+    jq.run_once(fire, delay, data={"rid": rid, "chat": chat_id, "text": text}, name=rid)
+
+
+async def post_init(app: Application):
+    try:
+        for r in await asyncio.to_thread(_rows, "remind"):
+            due_s, chat = str(r["сума"]).split("|")
+            schedule(app.job_queue, r["id"], int(chat), datetime.fromisoformat(due_s), r["текст"])
+    except Exception:
+        log.exception("Не вдалося відновити нагадування")
+
+
+# ---------- AI ----------
+ai = genai.Client(api_key=GEMINI_API_KEY)
+SYSTEM = (
+    "Ти — теплий і лаконічний сімейний помічник у Telegram. Відповідай українською, "
+    "коротко і по справі, без Markdown-розмітки. "
+)
+
+
+def ask_ai(question, user):
+    shop = [r["текст"] for r in _rows("shop")]
+    tasks = [r["текст"] for r in _rows("tasks")]
+    ctx = (
+        f"Зараз {now():%d.%m.%Y %H:%M}. З тобою говорить {user}. "
+        f"Список покупок: {shop}. Відкриті завдання: {tasks}."
+    )
+    r = ai.models.generate_content(
+        model=MODEL,
+        contents=question,
+        config=types.GenerateContentConfig(system_instruction=SYSTEM + ctx),
+    )
+    return (r.text or "Не вдалося отримати відповідь.")[:4000]
+
+
+# ---------- Хендлери ----------
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
         return
-    photo_row = random.choice(records)
-    await callback.message.answer_photo(
-        photo=photo_row.get("File_ID"),
-        caption=f"📸 **{photo_row.get('Опис')}**\n📅 Дата: {photo_row.get('Дата')}",
-        parse_mode="Markdown"
-    )
-    await callback.answer()
+    ctx.user_data["mode"] = None
+    await update.message.reply_text(MENU_TEXT, reply_markup=menu_kb())
 
-# ==========================================
-# 6. РОЗВАГИ ТА ІГРИ
-# ==========================================
-@dp.callback_query(F.data == "menu_games")
-async def show_games(callback: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 Випадковий фільм на вечір", callback_data="game_movie")],
-        [InlineKeyboardButton(text="🍕 Що приготувати / замовити?", callback_data="game_food")],
-        [InlineKeyboardButton(text="😂 Сімейний жарт", callback_data="game_joke")],
-        [InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]
-    ])
-    await callback.message.edit_text("🎲 **Сімейні розваги та вибір без суперечок:**", reply_markup=kb, parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith("game_"))
-async def play_game(callback: types.CallbackQuery):
-    action = callback.data.split("_")[1]
-    prompts = {
-        "movie": "Порадь один чудовий сімейний фільм або мультфільм для перегляду ввечері всією родиною з дітьми. Напиши назву, рік та 2 речення опису українською мовою.",
-        "food": "Запропонуй 3 швидкі та смачні ідеї для сімейної вечері українською мовою.",
-        "joke": "Розкажи один добрий, веселий сімейний жарт українською мовою."
-    }
-    await callback.answer("Думаю... 🎲")
-    response = ai_client.models.generate_content(model="gemini-1.5-flash", contents=prompts[action])
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎲 Ще варіант", callback_data=f"game_{action}"),
-                                                 InlineKeyboardButton(text="« Назад", callback_data="menu_games")]])
-    await callback.message.edit_text(response.text, reply_markup=kb)
+async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
 
-# ==========================================
-# 7. РОЗУМНИЙ ШІ-ПОМІЧНИК
-# ==========================================
-@dp.callback_query(F.data == "menu_ai")
-async def start_ai(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer(
-        "🧠 **Розумний сімейний помічник на зв'язку!**\n\n"
-        "Запитайте що завгодно звичайною мовою, наприклад:\n"
-        "• *Склади меню на вихідні для сім'ї з 4 людей*\n"
-        "• *Що купити на вечерю з курки та овочів?*\n"
-        "• *Придумай привітання з днем народження для бабусі*"
-    )
-    await state.set_state(BotStates.ask_ai)
-    await callback.answer()
 
-@dp.message(BotStates.ask_ai)
-async def answer_ai(message: types.Message, state: FSMContext):
-    wait_msg = await message.answer("⏳ Думаю над відповіддю...")
-    prompt = (
-        "Ти — дружній, турботливий розумний сімейний помічник для української родини (тато, мама, двоє дітей). "
-        "Відповідай українською мовою, структуровано, тепло і по суті.\n\n"
-        f"Запит користувача: {message.text}"
-    )
-    try:
-        response = ai_client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Головне меню", callback_data="back_home")]])
-        await wait_msg.edit_text(response.text, reply_markup=kb)
-    except Exception as e:
-        await wait_msg.edit_text(f"Помилка ШІ: {e}")
+async def send_view(update: Update, key: str):
+    text, kb = await asyncio.to_thread(build_view, key)
+    await update.effective_chat.send_message(text, reply_markup=kb)
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
-async def health_check(request):
-    return web.Response(text="Family Bot is running!")
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+async def open_section(update: Update, ctx: ContextTypes.DEFAULT_TYPE, key: str):
+    ctx.user_data["mode"] = key
+    if key == "ai":
+        await update.effective_chat.send_message(
+            "🤖 AI-помічник\n\nПишіть будь-яке питання: рецепт, план дня, ідея подарунка. "
+            "Я бачу ваші списки покупок і завдань.",
+            reply_markup=M([BACK]),
+        )
+    elif key == "photos":
+        rows = await asyncio.to_thread(_rows, "photos")
+        await update.effective_chat.send_message(
+            f"📸 Фотоальбом\n\nУ альбомі: {len(rows)}. Надішліть фото (з підписом), щоб додати.",
+            reply_markup=M([BACK]),
+        )
+        for r in rows[-5:]:
+            await update.effective_chat.send_photo(
+                str(r["сума"]), caption=f"{r['дата']} · {r['автор']} {r['текст']}"
+            )
+    else:
+        await send_view(update, key)
 
-async def main():
-    await start_web_server()
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+
+async def on_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not allowed(update):
+        return
+    data = q.data
+    if data == "menu":
+        ctx.user_data["mode"] = None
+        await q.message.edit_text(MENU_TEXT, reply_markup=menu_kb())
+        return
+    kind, _, rest = data.partition(":")
+    if kind == "m":
+        await open_section(update, ctx, rest)
+    elif kind == "d":
+        key, rid = rest.split(":")
+        for job in ctx.job_queue.get_jobs_by_name(rid):
+            job.schedule_removal()
+        await asyncio.to_thread(_del, key, rid)
+        text, kb = await asyncio.to_thread(build_view, key)
+        await q.message.edit_text(text, reply_markup=kb)
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    mode = ctx.user_data.get("mode")
+    text = update.message.text.strip()
+    user = update.effective_user.first_name or "Хтось"
+
+    if mode in CHECK:
+        lines = [l.strip(" -•") for l in text.splitlines() if l.strip()]
+        for l in lines:
+            await asyncio.to_thread(_add, mode, user, l)
+        await send_view(update, mode)
+    elif mode in ("events", "shifts"):
+        await asyncio.to_thread(_add, mode, user, text)
+        await send_view(update, mode)
+    elif mode == "budget":
+        m = re.search(r"(\d+(?:[.,]\d+)?)", text)
+        if not m:
+            await update.message.reply_text("Не бачу суми. Напишіть, напр.: хліб 45")
+            return
+        amount = float(m[1].replace(",", "."))
+        if not text.startswith("+"):
+            amount = -amount
+        desc = (text[: m.start()] + text[m.end() :]).strip(" +-") or "без опису"
+        await asyncio.to_thread(_add, "budget", user, desc, amount)
+        await send_view(update, "budget")
+    elif mode == "remind":
+        try:
+            parsed = parse_when(text)
+        except ValueError:
+            parsed = None
+        if not parsed:
+            await update.message.reply_text(
+                "Не зрозумів час. Приклади: «30 хв чайник», «18:30 дзвінок», «20.11 09:00 лікар»."
+            )
+            return
+        due, what = parsed
+        chat_id = update.effective_chat.id
+        rid = await asyncio.to_thread(_add, "remind", user, what, f"{due.isoformat()}|{chat_id}")
+        schedule(ctx.job_queue, rid, chat_id, due, what)
+        await send_view(update, "remind")
+    elif mode == "ai":
+        await update.effective_chat.send_action("typing")
+        try:
+            answer = await asyncio.to_thread(ask_ai, text, user)
+        except Exception:
+            log.exception("Gemini error")
+            answer = "Не вдалося звернутися до AI. Перевірте GEMINI_API_KEY та назву моделі."
+        await update.message.reply_text(answer, reply_markup=M([BACK]))
+    else:
+        await update.message.reply_text("Оберіть розділ:", reply_markup=menu_kb())
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    user = update.effective_user.first_name or "Хтось"
+    file_id = update.message.photo[-1].file_id
+    await asyncio.to_thread(_add, "photos", user, update.message.caption or "", file_id)
+    await update.message.reply_text("📸 Збережено в сімейний альбом.", reply_markup=M([BACK]))
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("Помилка", exc_info=ctx.error)
+
+
+# ---------- Health-check для Render (Web Service) ----------
+class _H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *a):
+        pass
+
+
+def _serve():
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", "10000"))), _H).serve_forever()
+
+
+def main():
+    threading.Thread(target=_serve, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler(["start", "menu"], cmd_start))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CallbackQueryHandler(on_btn))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
