@@ -15,9 +15,9 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 logging.basicConfig(level=logging.INFO)
 
 # --- НАЛАШТУВАННЯ ---
-TOKEN = "9068759664:AAFTqqBUYwX8wRHRzyz3hvsfLf5aFNOtSvk"
-SPREADSHEET_ID = "1PFK_1jeFHyK5AxBxjoqMGdJieMCtQe7XksBWY1hnmsU"
-GEMINI_API_KEY = "AQ.Ab8RN6JRgTBlbdv3CBB9CDi4QCH-lDsEB2Tb8Igbye8NWRYhIA"
+TOKEN = ""
+SPREADSHEET_ID = ""
+GEMINI_API_KEY = ""
 
 # Ініціалізація ШІ
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
